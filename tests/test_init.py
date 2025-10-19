@@ -54,6 +54,34 @@ class _MockConfigEntry:
 
 
 @pytest.mark.asyncio
+async def test_async_get_options_flow_returns_handler() -> None:
+    """The options flow factory returns a configured handler instance."""
+
+    entry = _MockConfigEntry("entry-options", {"endpoint": "https://example.invalid/api"})
+    handler = await integration.async_get_options_flow(entry)  # type: ignore[arg-type]
+    assert isinstance(handler, integration.AIEmbodiedOptionsFlowHandler)
+    assert handler._config_entry is entry  # type: ignore[attr-defined]
+
+
+def test_async_get_clientsession_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The helper proxies to Home Assistant's aiohttp client session helper."""
+
+    sentinel = object()
+
+    def _fake_get_clientsession(hass: object) -> object:  # noqa: ANN001
+        assert hass == "hass"
+        return sentinel
+
+    monkeypatch.setattr(
+        integration.aiohttp_client,
+        "async_get_clientsession",
+        _fake_get_clientsession,
+    )
+
+    assert integration._async_get_clientsession("hass") is sentinel
+
+
+@pytest.mark.asyncio
 async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """Setting up an entry creates runtime data and registers reload listener."""
 
