@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import pytest
-from homeassistant.data_entry_flow import FlowResultType
 
 from custom_components.aiembodied.config_flow import (
     AIEmbodiedConfigFlow,
@@ -25,6 +24,7 @@ from custom_components.aiembodied.const import (
     OPTIONS_DEBUG,
     OPTIONS_MAX_EVENTS_PER_MINUTE,
 )
+from homeassistant.data_entry_flow import FlowResultType
 
 
 @dataclass

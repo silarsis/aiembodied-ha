@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aiohttp import ClientSession
+from homeassistant.components import conversation as ha_conversation
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import aiohttp_client
@@ -24,6 +25,7 @@ from .const import (
     DATA_RUNTIME,
     DOMAIN,
 )
+from .conversation import AIEmbodiedConversationAgent
 
 TYPE_CHECKING = False
 
@@ -47,6 +49,7 @@ class RuntimeData:
 
     client: AIEmbodiedClient
     config: IntegrationConfig
+    agent: AIEmbodiedConversationAgent
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -63,10 +66,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     runtime_config = _create_integration_config(entry.data)
     client = _create_client(hass, runtime_config)
-    hass.data[DOMAIN][entry.entry_id] = {
-        DATA_RUNTIME: RuntimeData(client=client, config=runtime_config)
-    }
+    agent = AIEmbodiedConversationAgent(client, runtime_config)
+    runtime = RuntimeData(client=client, config=runtime_config, agent=agent)
+    hass.data[DOMAIN][entry.entry_id] = {DATA_RUNTIME: runtime}
 
+    ha_conversation.async_set_agent(hass, entry, agent)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     return True
 
@@ -74,6 +78,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
 
+    ha_conversation.async_unset_agent(hass, entry)
     hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     return True
 
