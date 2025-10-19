@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from aiohttp import ClientSession
@@ -12,7 +12,18 @@ from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.typing import ConfigType
 
 from .api_client import AIEmbodiedClient, AIEmbodiedClientConfig
-from .const import CONF_AUTH_TOKEN, CONF_ENDPOINT, CONF_HEADERS, DATA_RUNTIME, DOMAIN
+from .config_flow import AIEmbodiedOptionsFlowHandler
+from .const import (
+    CONF_AUTH_TOKEN,
+    CONF_BATCHING,
+    CONF_ENDPOINT,
+    CONF_EXPOSURE,
+    CONF_HEADERS,
+    CONF_ROUTING,
+    CONF_THROTTLE,
+    DATA_RUNTIME,
+    DOMAIN,
+)
 
 TYPE_CHECKING = False
 
@@ -24,6 +35,10 @@ class IntegrationConfig:
     endpoint: str
     auth_token: str | None
     headers: dict[str, str]
+    exposure: list[str] = field(default_factory=list)
+    throttle: int | None = None
+    batching: bool = False
+    routing: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -88,7 +103,19 @@ def _create_integration_config(entry_data: dict[str, Any]) -> IntegrationConfig:
         endpoint=entry_data[CONF_ENDPOINT],
         auth_token=entry_data.get(CONF_AUTH_TOKEN),
         headers=dict(entry_data.get(CONF_HEADERS, {})),
+        exposure=list(entry_data.get(CONF_EXPOSURE, [])),
+        throttle=entry_data.get(CONF_THROTTLE),
+        batching=bool(entry_data.get(CONF_BATCHING, False)),
+        routing=dict(entry_data.get(CONF_ROUTING, {})),
     )
+
+
+async def async_get_options_flow(
+    config_entry: ConfigEntry,
+) -> AIEmbodiedOptionsFlowHandler:
+    """Return the options flow handler."""
+
+    return AIEmbodiedOptionsFlowHandler(config_entry)
 
 
 def _async_get_clientsession(hass: HomeAssistant) -> ClientSession:
