@@ -1,0 +1,10 @@
+{
+  "domain": "aiembodied",
+  "name": "AI Embodied Assistant",
+  "version": "0.1.0",
+  "documentation": "https://example.com/aiembodied",
+  "codeowners": ["@openai"],
+  "dependencies": ["conversation"],
+  "requirements": [],
+  "iot_class": "cloud_polling"
+}
