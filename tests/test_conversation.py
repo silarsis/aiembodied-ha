@@ -1,0 +1,154 @@
+"""Tests for the aiembodied conversation agent."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+import pytest
+
+import custom_components.aiembodied as integration
+from custom_components.aiembodied.api_client import AIEmbodiedClientError
+from custom_components.aiembodied.const import DATA_RUNTIME, DOMAIN
+from homeassistant.components import conversation
+from homeassistant.core import Context, HomeAssistant
+
+
+@dataclass
+class _DummyConfigEntries:
+    """Minimal config entries manager used for reload tests."""
+
+    async_reload: Any
+
+
+class _DummyHass(HomeAssistant):
+    """Simple Home Assistant substitute for tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config_entries = _DummyConfigEntries(async_reload=self._async_reload)
+        self.reloads: list[str] = []
+
+    async def _async_reload(self, entry_id: str) -> None:
+        self.reloads.append(entry_id)
+
+
+class _MockConfigEntry:
+    """Config entry stub providing the hooks used by the integration."""
+
+    def __init__(self, entry_id: str, data: dict[str, Any]) -> None:
+        self.entry_id = entry_id
+        self.data = data
+        self._update_listener: Any = None
+        self._unload_callbacks: list[Any] = []
+
+    def add_update_listener(self, listener: Any) -> Any:
+        self._update_listener = listener
+
+        def _remove() -> None:
+            self._update_listener = None
+
+        return _remove
+
+    def async_on_unload(self, callback: Any) -> None:
+        self._unload_callbacks.append(callback)
+
+
+class _StubClient:
+    """Fake API client capturing payloads sent by the agent."""
+
+    def __init__(self, response: dict[str, Any]) -> None:
+        self.response = response
+        self.requests: list[dict[str, Any]] = []
+
+    async def async_post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        self.requests.append(payload)
+        return self.response
+
+
+class _FailingClient(_StubClient):
+    """Client that raises an API error."""
+
+    async def async_post_json(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raise AIEmbodiedClientError("boom")
+
+
+@pytest.mark.asyncio
+async def test_conversation_agent_handles_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The conversation agent sends structured payloads and returns responses."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry(
+        "entry-1",
+        {
+            "endpoint": "https://example.invalid/api",
+            "auth_token": "token",
+            "headers": {"X-Test": "1"},
+            "exposure": ["light.kitchen"],
+            "throttle": 30,
+            "batching": True,
+            "routing": {"pipeline": "assist"},
+        },
+    )
+
+    client = _StubClient({"reply": "Hi there!", "conversation_id": "remote-123"})
+    monkeypatch.setattr(integration, "_create_client", lambda hass, config: client)
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    runtime_wrapper = hass.data[DOMAIN][entry.entry_id]
+    runtime = runtime_wrapper[DATA_RUNTIME]
+    agent = conversation.async_get_agent(hass, entry.entry_id)
+
+    assert agent is runtime.agent
+
+    result = await agent.async_handle(
+        conversation.ConversationInput(
+            text="Turn on the lights",
+            conversation_id="local-456",
+            language="en",
+            device_id="device-1",
+            context=Context(id="context-1", user_id="user-1"),
+        )
+    )
+
+    assert result.conversation_id == "remote-123"
+    assert result.response.text == "Hi there!"
+    assert result.response.language == "en"
+
+    payload = client.requests.pop()
+    assert payload["input"] == {
+        "text": "Turn on the lights",
+        "conversation_id": "local-456",
+        "language": "en",
+        "device_id": "device-1",
+    }
+    assert payload["config"] == {
+        "exposure": ["light.kitchen"],
+        "batching": True,
+        "throttle": 30,
+        "routing": {"pipeline": "assist"},
+    }
+    assert payload["context"] == {"id": "context-1", "user_id": "user-1"}
+
+    assert await integration.async_unload_entry(hass, entry)
+    assert conversation.async_get_agent(hass, entry.entry_id) is None
+
+
+@pytest.mark.asyncio
+async def test_conversation_agent_wraps_client_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Client errors are surfaced as conversation errors."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry("entry-2", {"endpoint": "https://example.invalid/api"})
+
+    client = _FailingClient({})
+    monkeypatch.setattr(integration, "_create_client", lambda hass, config: client)
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    agent = conversation.async_get_agent(hass, entry.entry_id)
+    with pytest.raises(conversation.ConversationError):
+        await agent.async_handle(conversation.ConversationInput(text="Hello"))

@@ -3,7 +3,7 @@
 ## Progress Log
 - [x] Step 1 – Integration scaffolding (runtime container + API client skeleton) completed in this iteration.
 - [x] Step 2 – Config & options flows completed in this iteration.
-- [ ] Step 3 – Conversation agent implementation (pending).
+- [x] Step 3 – Conversation agent implementation completed in this iteration.
 - [ ] Step 4 – Assist routing helpers (pending).
 - [ ] Step 5 – Event & script exposure (pending).
 - [ ] Step 6 – Outbound action execution (pending).

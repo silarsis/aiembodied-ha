@@ -5,8 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from aiohttp import ClientError
 
+from aiohttp import ClientError
 from custom_components.aiembodied.api_client import (
     AIEmbodiedClient,
     AIEmbodiedClientConfig,
