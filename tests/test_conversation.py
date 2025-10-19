@@ -73,6 +73,22 @@ class _FailingClient(_StubClient):
         raise AIEmbodiedClientError("boom")
 
 
+def _make_config(**overrides: Any) -> integration.IntegrationConfig:
+    """Helper to construct integration configs for conversation tests."""
+
+    base = dict(
+        endpoint="https://example.invalid/api",
+        auth_token=None,
+        headers={},
+        exposure=[],
+        throttle=None,
+        batching=False,
+        routing={},
+    )
+    base.update(overrides)
+    return integration.IntegrationConfig(**base)
+
+
 @pytest.mark.asyncio
 async def test_conversation_agent_handles_requests(monkeypatch: pytest.MonkeyPatch) -> None:
     """The conversation agent sends structured payloads and returns responses."""
@@ -152,3 +168,46 @@ async def test_conversation_agent_wraps_client_errors(monkeypatch: pytest.Monkey
     agent = conversation.async_get_agent(hass, entry.entry_id)
     with pytest.raises(conversation.ConversationError):
         await agent.async_handle(conversation.ConversationInput(text="Hello"))
+
+
+def test_conversation_agent_metadata_and_text_coercion() -> None:
+    """Metadata properties and text coercion helpers are exercised."""
+
+    config = _make_config(exposure=["light.kitchen"], routing={"pipeline": "assist"})
+    agent = integration.AIEmbodiedConversationAgent(_StubClient({"reply": "ok"}), config)
+
+    assert agent.supported_languages == {"*"}
+    assert agent.attribution == {"name": "Embodied AI"}
+    assert agent._serialize_context(None) is None
+    assert agent._serialize_context(Context(id="ctx")) == {"id": "ctx"}
+    assert agent._coerce_text({"text": "  hi  "}) == "hi"
+
+
+@pytest.mark.asyncio
+async def test_conversation_agent_errors_when_text_missing() -> None:
+    """Missing textual responses raise conversation errors."""
+
+    config = _make_config()
+    agent = integration.AIEmbodiedConversationAgent(_StubClient({}), config)
+
+    with pytest.raises(conversation.ConversationError):
+        await agent.async_handle(conversation.ConversationInput(text="Hello"))
+
+
+@pytest.mark.asyncio
+async def test_conversation_agent_conversation_id_fallback() -> None:
+    """Conversation id falls back to the local value when not provided."""
+
+    config = _make_config()
+    client = _StubClient({"reply": "hi"})
+    agent = integration.AIEmbodiedConversationAgent(client, config)
+
+    result = await agent.async_handle(
+        conversation.ConversationInput(
+            text="Hello",
+            conversation_id="local-id",
+            language="en",
+        )
+    )
+
+    assert result.conversation_id == "local-id"

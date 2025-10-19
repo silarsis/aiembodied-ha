@@ -9,6 +9,8 @@ import pytest
 from custom_components.aiembodied.config_flow import (
     AIEmbodiedConfigFlow,
     AIEmbodiedOptionsFlowHandler,
+    _normalize_config_data,
+    _parse_mapping,
 )
 from custom_components.aiembodied.const import (
     CONF_AUTH_TOKEN,
@@ -207,3 +209,74 @@ async def test_options_flow_validates_positive_ints() -> None:
     assert response["type"] == FlowResultType.FORM
     assert response["errors"][OPTIONS_MAX_EVENTS_PER_MINUTE] == "invalid_positive_int"
     assert response["errors"][OPTIONS_BURST_SIZE] == "invalid_positive_int"
+
+
+@pytest.mark.asyncio
+async def test_user_flow_requires_endpoint() -> None:
+    """Missing endpoints surface as required field errors."""
+
+    hass = _DummyHass()
+    flow = AIEmbodiedConfigFlow()
+    flow.hass = hass  # type: ignore[assignment]
+
+    response = await flow.async_step_user({CONF_THROTTLE: 60})
+    assert response["type"] == FlowResultType.FORM
+    assert response["errors"][CONF_ENDPOINT] == "required"
+
+
+@pytest.mark.asyncio
+async def test_user_flow_validates_throttle_values() -> None:
+    """Throttle values must be positive integers."""
+
+    hass = _DummyHass()
+    flow = AIEmbodiedConfigFlow()
+    flow.hass = hass  # type: ignore[assignment]
+
+    invalid_type = await flow.async_step_user(
+        {CONF_ENDPOINT: "https://example.invalid", CONF_THROTTLE: "abc"}
+    )
+    assert invalid_type["type"] == FlowResultType.FORM
+    assert invalid_type["errors"][CONF_THROTTLE] == "invalid_throttle"
+
+    non_positive = await flow.async_step_user(
+        {CONF_ENDPOINT: "https://example.invalid", CONF_THROTTLE: 0}
+    )
+    assert non_positive["type"] == FlowResultType.FORM
+    assert non_positive["errors"][CONF_THROTTLE] == "invalid_throttle"
+
+
+def test_parse_mapping_variants() -> None:
+    """Mapping parser supports multiple input formats and errors."""
+
+    assert _parse_mapping({"A": 1}) == {"A": "1"}
+    assert _parse_mapping("foo: 1\n\nbar: 2") == {"foo": "1", "bar": "2"}
+
+    with pytest.raises(ValueError):
+        _parse_mapping(": missing")
+
+    with pytest.raises(ValueError):
+        _parse_mapping('["not", "a", "mapping"]')
+
+
+def test_normalize_config_data_coerces_values() -> None:
+    """Normalization coerces optional fields and parses collections."""
+
+    data = _normalize_config_data(
+        {
+            CONF_ENDPOINT: " https://example.invalid ",
+            CONF_AUTH_TOKEN: "  ",
+            CONF_HEADERS: {"X-Test": 1},
+            CONF_EXPOSURE: ["light.kitchen", ""],
+            CONF_ROUTING: "pipeline: assist",
+            CONF_THROTTLE: 5,
+            CONF_BATCHING: False,
+        }
+    )
+
+    assert data[CONF_ENDPOINT] == "https://example.invalid"
+    assert data[CONF_AUTH_TOKEN] is None
+    assert data[CONF_HEADERS] == {"X-Test": "1"}
+    assert data[CONF_EXPOSURE] == ["light.kitchen"]
+    assert data[CONF_ROUTING] == {"pipeline": "assist"}
+    assert data[CONF_THROTTLE] == 5
+    assert data[CONF_BATCHING] is False

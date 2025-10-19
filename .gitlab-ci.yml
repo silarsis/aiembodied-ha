@@ -1,0 +1,29 @@
+stages:
+  - test
+
+default:
+  image: python:3.13-slim
+  before_script:
+    - python -m pip install --upgrade pip
+    - pip install uv
+    - uv sync --dev
+
+unit-tests:
+  stage: test
+  script:
+    - mkdir -p artifacts
+    - uv run ruff check
+    - uv run pytest --cov=custom_components --cov-report=xml:artifacts/cov.xml \
+      --junitxml=artifacts/junit.xml
+  artifacts:
+    when: always
+    paths:
+      - artifacts/
+    reports:
+      junit: artifacts/junit.xml
+      coverage_report:
+        coverage_format: cobertura
+        path: artifacts/cov.xml
+  only:
+    - merge_requests
+    - main
