@@ -1,6 +1,16 @@
+[project]
+name = "aiembodied-ha"
+version = "0.0.0"
+description = "Home Assistant integration for AI Embodied"
+requires-python = ">=3.13"
+
 [build-system]
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["custom_components*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -9,7 +19,7 @@ pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]

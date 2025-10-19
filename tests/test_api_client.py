@@ -111,3 +111,11 @@ async def test_async_post_json_raises_client_error() -> None:
 
     with pytest.raises(AIEmbodiedClientError):
         await client.async_post_json({})
+
+
+def test_client_config_property() -> None:
+    """The config property exposes the configuration dataclass."""
+
+    config = AIEmbodiedClientConfig(endpoint="https://example.invalid/api", timeout=7)
+    client = AIEmbodiedClient(_StubSession(), config)  # type: ignore[arg-type]
+    assert client.config is config
