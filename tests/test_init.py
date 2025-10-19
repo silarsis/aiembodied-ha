@@ -25,9 +25,35 @@ class _DummyHass:
         self.data: dict[str, dict[str, object]] = {}
         self.config_entries = _DummyConfigEntries(async_reload=self._async_reload)
         self.reload_requests: list[str] = []
+        self.services = _DummyServices()
 
     async def _async_reload(self, entry_id: str) -> None:
         self.reload_requests.append(entry_id)
+
+
+class _DummyServices:
+    """Service registry stub capturing registrations."""
+
+    def __init__(self) -> None:
+        self.registered: dict[tuple[str, str], dict[str, object]] = {}
+
+    def has_service(self, domain: str, service: str) -> bool:
+        return (domain, service) in self.registered
+
+    def async_register(
+        self,
+        domain: str,
+        service: str,
+        handler: object,
+        *,
+        schema: object | None = None,
+        supports_response: bool = False,
+    ) -> None:
+        self.registered[(domain, service)] = {
+            "handler": handler,
+            "schema": schema,
+            "supports_response": supports_response,
+        }
 
 
 class _MockConfigEntry:

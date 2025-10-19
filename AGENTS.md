@@ -4,7 +4,7 @@
 - [x] Step 1 – Integration scaffolding (runtime container + API client skeleton) completed in this iteration.
 - [x] Step 2 – Config & options flows completed in this iteration.
 - [x] Step 3 – Conversation agent implementation completed in this iteration.
-- [ ] Step 4 – Assist routing helpers (pending).
+- [x] Step 4 – Assist routing helpers completed in this iteration.
 - [ ] Step 5 – Event & script exposure (pending).
 - [ ] Step 6 – Outbound action execution (pending).
 - [ ] Step 7 – Autonomy controls & diagnostics (pending).
