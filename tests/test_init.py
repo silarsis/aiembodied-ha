@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
@@ -36,6 +37,7 @@ class _MockConfigEntry:
     def __init__(self, entry_id: str, data: dict[str, object]) -> None:
         self.entry_id = entry_id
         self.data = data
+        self.options: dict[str, Any] = {}
         self._update_listener: Callable[[object], Awaitable[None]] | None = None
         self._unload_callbacks: list[Callable[[], None]] = []
 
@@ -53,6 +55,20 @@ class _MockConfigEntry:
         self._unload_callbacks.append(callback)
 
 
+class _DummyAgentManager:
+    """Fake conversation agent manager tracking registrations."""
+
+    def __init__(self) -> None:
+        self.set_calls: list[tuple[str, object]] = []
+        self.unset_calls: list[str] = []
+
+    def async_set_agent(self, agent_id: str, agent: object) -> None:
+        self.set_calls.append((agent_id, agent))
+
+    def async_unset_agent(self, agent_id: str) -> None:
+        self.unset_calls.append(agent_id)
+
+
 @pytest.mark.asyncio
 async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
     """Setting up an entry creates runtime data and registers reload listener."""
@@ -66,8 +82,10 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
             "headers": {"X-Test": "1"},
         },
     )
+    entry.options = {"debug": True}
 
     created_clients: list[object] = []
+    created_agents: list[object] = []
 
     class _DummyClient:
         pass
@@ -80,11 +98,20 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
         created_clients.append(client)
         return client
 
+    manager = _DummyAgentManager()
+
+    class _DummyAgent:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+            created_agents.append(self)
+
     monkeypatch.setattr(integration, "_async_get_clientsession", _fake_session_factory)
     def _fake_client_constructor(*args: object, **kwargs: object) -> _DummyClient:
         return _fake_client_factory(*args, **kwargs)
 
     monkeypatch.setattr(integration, "AIEmbodiedClient", _fake_client_constructor)
+    monkeypatch.setattr(integration, "AIEmbodiedConversationAgent", _DummyAgent)
+    monkeypatch.setattr(integration, "get_agent_manager", lambda hass_obj: manager)
 
     assert await integration.async_setup(hass, {})
     assert await integration.async_setup_entry(hass, entry)
@@ -95,6 +122,9 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
     assert runtime.config.auth_token == "secret"
     assert runtime.config.headers == {"X-Test": "1"}
     assert isinstance(runtime.client, _DummyClient)
+    assert any(agent is runtime.agent for _, agent in manager.set_calls)
+    assert runtime.options == {"debug": True}
+    assert created_agents, "Expected conversation agent to be instantiated"
     assert created_clients, "Expected client factory to be invoked"
 
 
@@ -105,8 +135,16 @@ async def test_async_unload_entry_cleans_runtime(monkeypatch: pytest.MonkeyPatch
     hass = _DummyHass()
     entry = _MockConfigEntry("entry-2", {"endpoint": "https://example.invalid/api"})
 
+    manager = _DummyAgentManager()
+
+    class _DummyAgent:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
     monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
     monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(integration, "AIEmbodiedConversationAgent", _DummyAgent)
+    monkeypatch.setattr(integration, "get_agent_manager", lambda hass_obj: manager)
 
     await integration.async_setup(hass, {})
     await integration.async_setup_entry(hass, entry)
@@ -115,6 +153,7 @@ async def test_async_unload_entry_cleans_runtime(monkeypatch: pytest.MonkeyPatch
 
     assert await integration.async_unload_entry(hass, entry)
     assert entry.entry_id not in hass.data.get(DOMAIN, {})
+    assert manager.unset_calls == [entry.entry_id]
 
 
 @pytest.mark.asyncio

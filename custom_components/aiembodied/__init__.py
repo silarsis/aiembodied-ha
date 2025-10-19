@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from aiohttp import ClientSession
+from homeassistant.components.conversation import get_agent_manager
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import aiohttp_client
@@ -24,6 +25,7 @@ from .const import (
     DATA_RUNTIME,
     DOMAIN,
 )
+from .conversation import AIEmbodiedConversationAgent
 
 TYPE_CHECKING = False
 
@@ -47,6 +49,8 @@ class RuntimeData:
 
     client: AIEmbodiedClient
     config: IntegrationConfig
+    agent: AIEmbodiedConversationAgent
+    options: dict[str, Any]
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -63,18 +67,41 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     runtime_config = _create_integration_config(entry.data)
     client = _create_client(hass, runtime_config)
+    options = dict(entry.options)
+    agent = AIEmbodiedConversationAgent(
+        hass=hass,
+        entry_id=entry.entry_id,
+        client=client,
+        config=runtime_config,
+        options=options,
+    )
+
+    manager = get_agent_manager(hass)
+    manager.async_set_agent(entry.entry_id, agent)
+
     hass.data[DOMAIN][entry.entry_id] = {
-        DATA_RUNTIME: RuntimeData(client=client, config=runtime_config)
+        DATA_RUNTIME: RuntimeData(
+            client=client,
+            config=runtime_config,
+            agent=agent,
+            options=options,
+        )
     }
 
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
+    entry.async_on_unload(lambda: manager.async_unset_agent(entry.entry_id))
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
 
-    hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    runtime_wrapper = hass.data.get(DOMAIN, {})
+    runtime_wrapper.pop(entry.entry_id, None)
+
+    manager = get_agent_manager(hass)
+    manager.async_unset_agent(entry.entry_id)
+
     return True
 
 
