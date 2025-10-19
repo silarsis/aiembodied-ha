@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Mapping
 
 from aiohttp import ClientSession
 from homeassistant.components import conversation as ha_conversation
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Context, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.typing import ConfigType
 
@@ -56,6 +57,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     """Set up the aiembodied integration."""
 
     hass.data.setdefault(DOMAIN, {})
+    _async_register_services(hass)
     return True
 
 
@@ -127,3 +129,120 @@ def _async_get_clientsession(hass: HomeAssistant) -> ClientSession:
     """Retrieve the shared aiohttp client session."""
 
     return aiohttp_client.async_get_clientsession(hass)
+
+
+SERVICE_SEND_CONVERSATION_TURN = "send_conversation_turn"
+
+ATTR_ENTRY_ID = "entry_id"
+ATTR_TEXT = "text"
+ATTR_CONVERSATION_ID = "conversation_id"
+ATTR_LANGUAGE = "language"
+ATTR_DEVICE_ID = "device_id"
+ATTR_CONTEXT_ID = "context_id"
+ATTR_CONTEXT_USER_ID = "context_user_id"
+ATTR_CONTEXT_PARENT_ID = "context_parent_id"
+
+
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Register integration services once per Home Assistant instance."""
+
+    if hass.services.has_service(DOMAIN, SERVICE_SEND_CONVERSATION_TURN):
+        return
+
+    async def _async_handle_send_conversation_turn(call: Any) -> Mapping[str, Any]:
+        data = _validate_service_data(getattr(call, "data", {}))
+        entry_id = data[ATTR_ENTRY_ID]
+        runtime_wrapper = hass.data.get(DOMAIN, {}).get(entry_id)
+        if not runtime_wrapper:
+            raise HomeAssistantError(
+                f"No aiembodied configuration found for entry_id '{entry_id}'"
+            )
+
+        runtime: RuntimeData | None = runtime_wrapper.get(DATA_RUNTIME)
+        if runtime is None:
+            raise HomeAssistantError(
+                f"Integration for entry_id '{entry_id}' is not currently active"
+            )
+
+        conversation_input = _conversation_input_from_service_data(data)
+        result = await runtime.agent.async_handle(conversation_input)
+
+        response: dict[str, Any] = {"conversation_id": result.conversation_id}
+        if result.response is not None:
+            response["response"] = {
+                "text": result.response.text,
+                "language": result.response.language,
+                "data": result.response.data,
+            }
+        return response
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SEND_CONVERSATION_TURN,
+        _async_handle_send_conversation_turn,
+        supports_response=True,
+    )
+
+
+def _conversation_input_from_service_data(
+    data: Mapping[str, Any],
+) -> ha_conversation.ConversationInput:
+    """Build a ConversationInput instance from service data."""
+
+    context = _context_from_service_data(data)
+    return ha_conversation.ConversationInput(
+        text=data[ATTR_TEXT],
+        conversation_id=data.get(ATTR_CONVERSATION_ID),
+        language=data.get(ATTR_LANGUAGE),
+        device_id=data.get(ATTR_DEVICE_ID),
+        context=context,
+    )
+
+
+def _context_from_service_data(data: Mapping[str, Any]) -> Context | None:
+    """Create a Home Assistant context from service attributes."""
+
+    context_kwargs: dict[str, str] = {}
+    if context_id := data.get(ATTR_CONTEXT_ID):
+        context_kwargs["id"] = context_id
+    if user_id := data.get(ATTR_CONTEXT_USER_ID):
+        context_kwargs["user_id"] = user_id
+    if parent_id := data.get(ATTR_CONTEXT_PARENT_ID):
+        context_kwargs["parent_id"] = parent_id
+    if not context_kwargs:
+        return None
+    return Context(**context_kwargs)
+
+
+def _validate_service_data(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the payload received via the helper service."""
+
+    normalized: dict[str, Any] = {}
+
+    entry_id = data.get(ATTR_ENTRY_ID)
+    if not isinstance(entry_id, str) or not entry_id:
+        raise HomeAssistantError("Service data must include a non-empty entry_id")
+    normalized[ATTR_ENTRY_ID] = entry_id
+
+    text = data.get(ATTR_TEXT)
+    if not isinstance(text, str) or not text:
+        raise HomeAssistantError("Service data must include a non-empty text value")
+    normalized[ATTR_TEXT] = text
+
+    for attr in (
+        ATTR_CONVERSATION_ID,
+        ATTR_LANGUAGE,
+        ATTR_DEVICE_ID,
+        ATTR_CONTEXT_ID,
+        ATTR_CONTEXT_USER_ID,
+        ATTR_CONTEXT_PARENT_ID,
+    ):
+        value = data.get(attr)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise HomeAssistantError(f"Attribute '{attr}' must be a string if provided")
+        if value:
+            normalized[attr] = value
+
+    return normalized

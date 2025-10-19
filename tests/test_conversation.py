@@ -12,6 +12,7 @@ from custom_components.aiembodied.api_client import AIEmbodiedClientError
 from custom_components.aiembodied.const import DATA_RUNTIME, DOMAIN
 from homeassistant.components import conversation
 from homeassistant.core import Context, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 
 
 @dataclass
@@ -28,9 +29,53 @@ class _DummyHass(HomeAssistant):
         super().__init__()
         self.config_entries = _DummyConfigEntries(async_reload=self._async_reload)
         self.reloads: list[str] = []
+        self.services = _DummyServices()
 
     async def _async_reload(self, entry_id: str) -> None:
         self.reloads.append(entry_id)
+
+
+class _DummyServices:
+    """Minimal service registry for exercising helper services."""
+
+    def __init__(self) -> None:
+        self.handlers: dict[tuple[str, str], tuple[Any, bool]] = {}
+
+    def has_service(self, domain: str, service: str) -> bool:
+        return (domain, service) in self.handlers
+
+    def async_register(
+        self,
+        domain: str,
+        service: str,
+        handler: Any,
+        *,
+        supports_response: bool = False,
+        schema: Any | None = None,
+    ) -> None:
+        self.handlers[(domain, service)] = (handler, supports_response)
+
+    async def async_call(
+        self,
+        domain: str,
+        service: str,
+        data: dict[str, Any],
+        *,
+        blocking: bool = False,
+        return_response: bool = False,
+    ) -> Any:
+        handler, supports_response = self.handlers[(domain, service)]
+        result = await handler(_SimpleServiceCall(data))
+        if return_response and supports_response:
+            return result
+        return None
+
+
+class _SimpleServiceCall:
+    """Service call shim matching the attributes used by the handler."""
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.data = data
 
 
 class _MockConfigEntry:
@@ -170,6 +215,80 @@ async def test_conversation_agent_wraps_client_errors(monkeypatch: pytest.Monkey
         await agent.async_handle(conversation.ConversationInput(text="Hello"))
 
 
+@pytest.mark.asyncio
+async def test_send_conversation_turn_service_returns_agent_reply(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Service helper forwards requests to the configured conversation agent."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry(
+        "entry-3",
+        {
+            "endpoint": "https://example.invalid/api",
+            "exposure": ["light.living_room"],
+        },
+    )
+
+    client = _StubClient({"text": "Lights set", "conversation_id": "conv-789"})
+    monkeypatch.setattr(integration, "_create_client", lambda hass, config: client)
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    response = await hass.services.async_call(
+        integration.DOMAIN,
+        integration.SERVICE_SEND_CONVERSATION_TURN,
+        {
+            "entry_id": entry.entry_id,
+            "text": "Set the lights",
+            "conversation_id": "local-1",
+            "language": "en",
+            "device_id": "device-9",
+            "context_id": "ctx-1",
+            "context_user_id": "user-2",
+        },
+        blocking=True,
+        return_response=True,
+    )
+
+    assert response == {
+        "conversation_id": "conv-789",
+        "response": {
+            "text": "Lights set",
+            "language": "en",
+            "data": {"text": "Lights set", "conversation_id": "conv-789"},
+        },
+    }
+
+    payload = client.requests.pop()
+    assert payload["input"] == {
+        "text": "Set the lights",
+        "conversation_id": "local-1",
+        "language": "en",
+        "device_id": "device-9",
+    }
+    assert payload["config"] == {"exposure": ["light.living_room"], "batching": False}
+    assert payload["context"] == {"id": "ctx-1", "user_id": "user-2"}
+
+
+@pytest.mark.asyncio
+async def test_send_conversation_turn_service_requires_active_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Calling the helper without a configured entry raises an error."""
+
+    hass = _DummyHass()
+    await integration.async_setup(hass, {})
+
+    with pytest.raises(HomeAssistantError):
+        await hass.services.async_call(
+            integration.DOMAIN,
+            integration.SERVICE_SEND_CONVERSATION_TURN,
+            {"entry_id": "missing", "text": "hi"},
+            blocking=True,
+            return_response=True,
+        )
 def test_conversation_agent_metadata_and_text_coercion() -> None:
     """Metadata properties and text coercion helpers are exercised."""
 
