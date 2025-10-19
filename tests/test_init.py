@@ -1,0 +1,136 @@
+"""Tests for the aiembodied integration setup module."""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+import pytest
+
+import custom_components.aiembodied as integration
+from custom_components.aiembodied.const import DATA_RUNTIME, DOMAIN
+
+
+@dataclass
+class _DummyConfigEntries:
+    """Minimal config entries manager for testing reload behavior."""
+
+    async_reload: Callable[[str], Awaitable[None]]
+
+
+class _DummyHass:
+    """Simplified Home Assistant core object for unit tests."""
+
+    def __init__(self) -> None:
+        self.data: dict[str, dict[str, object]] = {}
+        self.config_entries = _DummyConfigEntries(async_reload=self._async_reload)
+        self.reload_requests: list[str] = []
+
+    async def _async_reload(self, entry_id: str) -> None:
+        self.reload_requests.append(entry_id)
+
+
+class _MockConfigEntry:
+    """Small stub mimicking the ConfigEntry interface used by the integration."""
+
+    def __init__(self, entry_id: str, data: dict[str, object]) -> None:
+        self.entry_id = entry_id
+        self.data = data
+        self._update_listener: Callable[[object], Awaitable[None]] | None = None
+        self._unload_callbacks: list[Callable[[], None]] = []
+
+    def add_update_listener(
+        self, listener: Callable[[object], Awaitable[None]]
+    ) -> Callable[[], None]:
+        self._update_listener = listener
+
+        def _remove() -> None:
+            self._update_listener = None
+
+        return _remove
+
+    def async_on_unload(self, callback: Callable[[], None]) -> None:
+        self._unload_callbacks.append(callback)
+
+
+@pytest.mark.asyncio
+async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Setting up an entry creates runtime data and registers reload listener."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry(
+        "entry-1",
+        {
+            "endpoint": "https://example.invalid/api",
+            "auth_token": "secret",
+            "headers": {"X-Test": "1"},
+        },
+    )
+
+    created_clients: list[object] = []
+
+    class _DummyClient:
+        pass
+
+    def _fake_session_factory(hass_obj: object) -> object:  # noqa: ANN001 - signature for monkeypatch
+        return object()
+
+    def _fake_client_factory(session: object, config: object) -> _DummyClient:  # noqa: ANN001
+        client = _DummyClient()
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(integration, "_async_get_clientsession", _fake_session_factory)
+    def _fake_client_constructor(*args: object, **kwargs: object) -> _DummyClient:
+        return _fake_client_factory(*args, **kwargs)
+
+    monkeypatch.setattr(integration, "AIEmbodiedClient", _fake_client_constructor)
+
+    assert await integration.async_setup(hass, {})
+    assert await integration.async_setup_entry(hass, entry)
+
+    runtime_wrapper = hass.data[DOMAIN][entry.entry_id]
+    runtime = runtime_wrapper[DATA_RUNTIME]
+    assert runtime.config.endpoint == "https://example.invalid/api"
+    assert runtime.config.auth_token == "secret"
+    assert runtime.config.headers == {"X-Test": "1"}
+    assert isinstance(runtime.client, _DummyClient)
+    assert created_clients, "Expected client factory to be invoked"
+
+
+@pytest.mark.asyncio
+async def test_async_unload_entry_cleans_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unloading an entry removes runtime state."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry("entry-2", {"endpoint": "https://example.invalid/api"})
+
+    monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
+    monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    assert entry.entry_id in hass.data[DOMAIN]
+
+    assert await integration.async_unload_entry(hass, entry)
+    assert entry.entry_id not in hass.data.get(DOMAIN, {})
+
+
+@pytest.mark.asyncio
+async def test_update_listener_triggers_reload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The update listener requests a reload when invoked."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry("entry-3", {"endpoint": "https://example.invalid/api"})
+
+    monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
+    monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    assert entry._update_listener is not None
+
+    await entry._update_listener(hass, entry)  # type: ignore[misc]
+    assert hass.reload_requests == [entry.entry_id]
