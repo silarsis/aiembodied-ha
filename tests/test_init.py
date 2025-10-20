@@ -126,6 +126,30 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
     class _DummyClient:
         pass
 
+    controllers: list[_DummyExposure] = []
+
+    class _DummyExposure:
+        def __init__(
+            self,
+            hass_obj: object,
+            client_obj: object,
+            config_obj: object,
+            entry_id: str,
+        ) -> None:  # noqa: ANN001
+            self.hass = hass_obj
+            self.client = client_obj
+            self.config = config_obj
+            self.entry_id = entry_id
+            self.setup_calls = 0
+            self.shutdown_calls = 0
+            controllers.append(self)
+
+        async def async_setup(self) -> None:
+            self.setup_calls += 1
+
+        async def async_shutdown(self) -> None:
+            self.shutdown_calls += 1
+
     def _fake_session_factory(hass_obj: object) -> object:  # noqa: ANN001 - signature for monkeypatch
         return object()
 
@@ -139,6 +163,7 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
         return _fake_client_factory(*args, **kwargs)
 
     monkeypatch.setattr(integration, "AIEmbodiedClient", _fake_client_constructor)
+    monkeypatch.setattr(integration, "ExposureController", _DummyExposure)
 
     assert await integration.async_setup(hass, {})
     assert await integration.async_setup_entry(hass, entry)
@@ -150,6 +175,7 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
     assert runtime.config.headers == {"X-Test": "1"}
     assert isinstance(runtime.client, _DummyClient)
     assert created_clients, "Expected client factory to be invoked"
+    assert controllers and controllers[0].setup_calls == 1
 
 
 @pytest.mark.asyncio
@@ -159,8 +185,26 @@ async def test_async_unload_entry_cleans_runtime(monkeypatch: pytest.MonkeyPatch
     hass = _DummyHass()
     entry = _MockConfigEntry("entry-2", {"endpoint": "https://example.invalid/api"})
 
+    class _DummyExposure:
+        def __init__(self, *args: object, **kwargs: object) -> None:  # noqa: ANN001
+            self.shutdown_calls = 0
+
+        async def async_setup(self) -> None:  # pragma: no cover - not exercised here
+            pass
+
+        async def async_shutdown(self) -> None:
+            self.shutdown_calls += 1
+
+    exposure_instances: list[_DummyExposure] = []
+
+    def _exposure_factory(*args: object, **kwargs: object) -> _DummyExposure:  # noqa: ANN001
+        exposure = _DummyExposure()
+        exposure_instances.append(exposure)
+        return exposure
+
     monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
     monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(integration, "ExposureController", _exposure_factory)
 
     await integration.async_setup(hass, {})
     await integration.async_setup_entry(hass, entry)
@@ -169,6 +213,7 @@ async def test_async_unload_entry_cleans_runtime(monkeypatch: pytest.MonkeyPatch
 
     assert await integration.async_unload_entry(hass, entry)
     assert entry.entry_id not in hass.data.get(DOMAIN, {})
+    assert exposure_instances and exposure_instances[0].shutdown_calls == 1
 
 
 @pytest.mark.asyncio

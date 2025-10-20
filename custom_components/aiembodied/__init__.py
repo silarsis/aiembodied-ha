@@ -27,6 +27,7 @@ from .const import (
     DOMAIN,
 )
 from .conversation import AIEmbodiedConversationAgent
+from .exposure import ExposureController
 
 TYPE_CHECKING = False
 
@@ -51,6 +52,7 @@ class RuntimeData:
     client: AIEmbodiedClient
     config: IntegrationConfig
     agent: AIEmbodiedConversationAgent
+    exposure: ExposureController | None
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -69,7 +71,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     runtime_config = _create_integration_config(entry.data)
     client = _create_client(hass, runtime_config)
     agent = AIEmbodiedConversationAgent(client, runtime_config)
-    runtime = RuntimeData(client=client, config=runtime_config, agent=agent)
+    exposure = ExposureController(hass, client, runtime_config, entry.entry_id)
+    await exposure.async_setup()
+    runtime = RuntimeData(
+        client=client,
+        config=runtime_config,
+        agent=agent,
+        exposure=exposure,
+    )
     hass.data[DOMAIN][entry.entry_id] = {DATA_RUNTIME: runtime}
 
     ha_conversation.async_set_agent(hass, entry, agent)
@@ -81,7 +90,13 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
 
     ha_conversation.async_unset_agent(hass, entry)
-    hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    runtime_wrapper = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
+    runtime: RuntimeData | None = None
+    if runtime_wrapper is not None:
+        runtime = runtime_wrapper.get(DATA_RUNTIME)
+
+    if runtime and runtime.exposure:
+        await runtime.exposure.async_shutdown()
     return True
 
 

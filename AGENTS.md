@@ -5,7 +5,7 @@
 - [x] Step 2 – Config & options flows completed in this iteration.
 - [x] Step 3 – Conversation agent implementation completed in this iteration.
 - [x] Step 4 – Assist routing helpers completed in this iteration.
-- [ ] Step 5 – Event & script exposure (pending).
+- [x] Step 5 – Event & script exposure completed in this iteration.
 - [ ] Step 6 – Outbound action execution (pending).
 - [ ] Step 7 – Autonomy controls & diagnostics (pending).
 - [ ] Step 8 – Networking & resilience enhancements (pending).
