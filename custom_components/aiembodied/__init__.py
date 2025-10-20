@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -13,7 +14,7 @@ from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.typing import ConfigType
 
-from .api_client import AIEmbodiedClient, AIEmbodiedClientConfig
+from .api_client import AIEmbodiedClient, AIEmbodiedClientConfig, AIEmbodiedClientError
 from .config_flow import AIEmbodiedOptionsFlowHandler
 from .const import (
     CONF_AUTH_TOKEN,
@@ -30,6 +31,9 @@ from .conversation import AIEmbodiedConversationAgent
 from .exposure import ExposureController
 
 TYPE_CHECKING = False
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -147,6 +151,7 @@ def _async_get_clientsession(hass: HomeAssistant) -> ClientSession:
 
 
 SERVICE_SEND_CONVERSATION_TURN = "send_conversation_turn"
+SERVICE_INVOKE_SERVICE = "invoke_service"
 
 ATTR_ENTRY_ID = "entry_id"
 ATTR_TEXT = "text"
@@ -156,6 +161,11 @@ ATTR_DEVICE_ID = "device_id"
 ATTR_CONTEXT_ID = "context_id"
 ATTR_CONTEXT_USER_ID = "context_user_id"
 ATTR_CONTEXT_PARENT_ID = "context_parent_id"
+ATTR_DOMAIN = "domain"
+ATTR_SERVICE = "service"
+ATTR_SERVICE_DATA = "service_data"
+ATTR_TARGET = "target"
+ATTR_CORRELATION_ID = "correlation_id"
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
@@ -198,6 +208,111 @@ def _async_register_services(hass: HomeAssistant) -> None:
         supports_response=True,
     )
 
+    async def _async_handle_invoke_service(call: Any) -> Mapping[str, Any]:
+        data = _validate_action_service_data(getattr(call, "data", {}))
+        entry_id = data[ATTR_ENTRY_ID]
+        runtime_wrapper = hass.data.get(DOMAIN, {}).get(entry_id)
+        if not runtime_wrapper:
+            raise HomeAssistantError(
+                f"No aiembodied configuration found for entry_id '{entry_id}'"
+            )
+
+        runtime: RuntimeData | None = runtime_wrapper.get(DATA_RUNTIME)
+        if runtime is None:
+            raise HomeAssistantError(
+                f"Integration for entry_id '{entry_id}' is not currently active"
+            )
+
+        context = _context_from_service_data(data)
+        domain = data[ATTR_DOMAIN]
+        service = data[ATTR_SERVICE]
+        service_data = dict(data.get(ATTR_SERVICE_DATA, {}))
+        target = data.get(ATTR_TARGET)
+        correlation_id = data.get(ATTR_CORRELATION_ID)
+
+        try:
+            result = await hass.services.async_call(
+                domain,
+                service,
+                service_data,
+                blocking=True,
+                return_response=True,
+                target=target,
+                context=context,
+            )
+        except HomeAssistantError as exc:
+            success = False
+            error_message = str(exc)
+            result = None
+        except Exception as exc:  # pragma: no cover - defensive safety net
+            success = False
+            error_message = str(exc)
+            result = None
+        else:
+            success = True
+            error_message = None
+
+        audit: dict[str, Any] = {
+            "entry_id": entry_id,
+            "domain": domain,
+            "service": service,
+            "correlation_id": correlation_id,
+            "success": success,
+        }
+        if target is not None:
+            audit["target"] = target
+        if error_message is not None:
+            audit["error"] = error_message
+
+        hass.bus.async_fire(f"{DOMAIN}.action_executed", audit)
+
+        payload: dict[str, Any] = {
+            "type": "action_result",
+            "action": {
+                "entry_id": entry_id,
+                "domain": domain,
+                "service": service,
+                "service_data": service_data,
+                "success": success,
+                "result": result,
+            },
+        }
+        if target is not None:
+            payload["action"]["target"] = target
+        if correlation_id is not None:
+            payload["action"]["correlation_id"] = correlation_id
+
+        context_dict = _serialize_context_for_action(context)
+        if context_dict is not None:
+            payload["action"]["context"] = context_dict
+
+        if not success and error_message is not None:
+            payload["action"]["error"] = error_message
+
+        try:
+            await runtime.client.async_post_json(payload)
+        except AIEmbodiedClientError as exc:
+            _LOGGER.warning(
+                "Failed to report action result for %s.%s: %s", domain, service, exc, exc_info=True
+            )
+
+        response: dict[str, Any] = {
+            "success": success,
+            "result": result,
+        }
+        if error_message is not None:
+            response["error"] = error_message
+        if correlation_id is not None:
+            response["correlation_id"] = correlation_id
+        return response
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_INVOKE_SERVICE,
+        _async_handle_invoke_service,
+        supports_response=True,
+    )
+
 
 def _conversation_input_from_service_data(
     data: Mapping[str, Any],
@@ -222,11 +337,37 @@ def _context_from_service_data(data: Mapping[str, Any]) -> Context | None:
         context_kwargs["id"] = context_id
     if user_id := data.get(ATTR_CONTEXT_USER_ID):
         context_kwargs["user_id"] = user_id
-    if parent_id := data.get(ATTR_CONTEXT_PARENT_ID):
+    parent_id = data.get(ATTR_CONTEXT_PARENT_ID)
+    if parent_id:
         context_kwargs["parent_id"] = parent_id
     if not context_kwargs:
         return None
-    return Context(**context_kwargs)
+
+    try:
+        return Context(**context_kwargs)
+    except TypeError:
+        # Fallback for stubbed Context implementations without parent_id support
+        context_kwargs.pop("parent_id", None)
+        context = Context(**context_kwargs)
+        if parent_id:
+            try:
+                setattr(context, "parent_id", parent_id)
+            except AttributeError:  # pragma: no cover - slots without parent_id attribute
+                pass
+        return context
+
+
+def _serialize_context_for_action(context: Context | None) -> dict[str, str] | None:
+    """Serialize context data for action result payloads."""
+
+    if context is None:
+        return None
+    result: dict[str, str] = {}
+    for attr in ("id", "user_id", "parent_id"):
+        value = getattr(context, attr, None)
+        if isinstance(value, str) and value:
+            result[attr] = value
+    return result or None
 
 
 def _validate_service_data(data: Mapping[str, Any]) -> dict[str, Any]:
@@ -248,6 +389,63 @@ def _validate_service_data(data: Mapping[str, Any]) -> dict[str, Any]:
         ATTR_CONVERSATION_ID,
         ATTR_LANGUAGE,
         ATTR_DEVICE_ID,
+        ATTR_CONTEXT_ID,
+        ATTR_CONTEXT_USER_ID,
+        ATTR_CONTEXT_PARENT_ID,
+    ):
+        value = data.get(attr)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise HomeAssistantError(f"Attribute '{attr}' must be a string if provided")
+        if value:
+            normalized[attr] = value
+
+    return normalized
+
+
+def _validate_action_service_data(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the payload for outbound service execution."""
+
+    normalized: dict[str, Any] = {}
+
+    entry_id = data.get(ATTR_ENTRY_ID)
+    if not isinstance(entry_id, str) or not entry_id:
+        raise HomeAssistantError("Service data must include a non-empty entry_id")
+    normalized[ATTR_ENTRY_ID] = entry_id
+
+    domain = data.get(ATTR_DOMAIN)
+    if not isinstance(domain, str) or not domain:
+        raise HomeAssistantError("Service data must include a non-empty domain")
+    normalized[ATTR_DOMAIN] = domain
+
+    service = data.get(ATTR_SERVICE)
+    if not isinstance(service, str) or not service:
+        raise HomeAssistantError("Service data must include a non-empty service")
+    normalized[ATTR_SERVICE] = service
+
+    service_data = data.get(ATTR_SERVICE_DATA)
+    if service_data is None:
+        normalized[ATTR_SERVICE_DATA] = {}
+    elif isinstance(service_data, Mapping):
+        normalized[ATTR_SERVICE_DATA] = dict(service_data)
+    else:
+        raise HomeAssistantError("Attribute 'service_data' must be a mapping if provided")
+
+    target = data.get(ATTR_TARGET)
+    if target is not None:
+        if not isinstance(target, Mapping):
+            raise HomeAssistantError("Attribute 'target' must be a mapping if provided")
+        normalized[ATTR_TARGET] = dict(target)
+
+    correlation_id = data.get(ATTR_CORRELATION_ID)
+    if correlation_id is not None:
+        if not isinstance(correlation_id, str):
+            raise HomeAssistantError("Attribute 'correlation_id' must be a string if provided")
+        if correlation_id:
+            normalized[ATTR_CORRELATION_ID] = correlation_id
+
+    for attr in (
         ATTR_CONTEXT_ID,
         ATTR_CONTEXT_USER_ID,
         ATTR_CONTEXT_PARENT_ID,

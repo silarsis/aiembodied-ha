@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 import pytest
 
 import custom_components.aiembodied as integration
 from custom_components.aiembodied.const import DATA_RUNTIME, DOMAIN
+from homeassistant.exceptions import HomeAssistantError
 
 
 @dataclass
@@ -26,9 +28,20 @@ class _DummyHass:
         self.config_entries = _DummyConfigEntries(async_reload=self._async_reload)
         self.reload_requests: list[str] = []
         self.services = _DummyServices()
+        self.bus = _DummyBus()
 
     async def _async_reload(self, entry_id: str) -> None:
         self.reload_requests.append(entry_id)
+
+
+class _DummyBus:
+    """Minimal event bus capturing fired events."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def async_fire(self, event_type: str, event_data: dict[str, Any]) -> None:
+        self.events.append((event_type, event_data))
 
 
 class _DummyServices:
@@ -36,6 +49,8 @@ class _DummyServices:
 
     def __init__(self) -> None:
         self.registered: dict[tuple[str, str], dict[str, object]] = {}
+        self.calls: list[dict[str, Any]] = []
+        self.async_call_handler: Callable[..., Any] | None = None
 
     def has_service(self, domain: str, service: str) -> bool:
         return (domain, service) in self.registered
@@ -54,6 +69,42 @@ class _DummyServices:
             "schema": schema,
             "supports_response": supports_response,
         }
+
+    async def async_call(
+        self,
+        domain: str,
+        service: str,
+        service_data: dict[str, Any] | None = None,
+        *,
+        blocking: bool = False,
+        return_response: bool = False,
+        target: dict[str, Any] | None = None,
+        context: object | None = None,
+    ) -> Any:
+        call = {
+            "domain": domain,
+            "service": service,
+            "service_data": service_data or {},
+            "blocking": blocking,
+            "return_response": return_response,
+            "target": target,
+            "context": context,
+        }
+        self.calls.append(call)
+        if self.async_call_handler is None:
+            return {}
+        result = self.async_call_handler(
+            domain,
+            service,
+            service_data or {},
+            target=target,
+            blocking=blocking,
+            return_response=return_response,
+            context=context,
+        )
+        if hasattr(result, "__await__"):
+            return await result  # type: ignore[return-value]
+        return result
 
 
 class _MockConfigEntry:
@@ -233,3 +284,223 @@ async def test_update_listener_triggers_reload(monkeypatch: pytest.MonkeyPatch) 
 
     await entry._update_listener(hass, entry)  # type: ignore[misc]
     assert hass.reload_requests == [entry.entry_id]
+
+
+@pytest.mark.asyncio
+async def test_services_registered_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both helper services are registered with response support."""
+
+    hass = _DummyHass()
+    monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
+    monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
+
+    class _StubExposure:
+        async def async_setup(self) -> None:
+            return None
+
+        async def async_shutdown(self) -> None:  # pragma: no cover - unload not exercised
+            return None
+
+    monkeypatch.setattr(
+        integration,
+        "ExposureController",
+        lambda *args, **kwargs: _StubExposure(),
+    )
+
+    await integration.async_setup(hass, {})
+    entry = _MockConfigEntry("entry-services", {"endpoint": "https://example.invalid/api"})
+    await integration.async_setup_entry(hass, entry)
+
+    services = hass.services.registered
+    send_meta = services[(DOMAIN, integration.SERVICE_SEND_CONVERSATION_TURN)]
+    invoke_meta = services[(DOMAIN, integration.SERVICE_INVOKE_SERVICE)]
+    assert send_meta["supports_response"] is True
+    assert invoke_meta["supports_response"] is True
+
+
+@pytest.mark.asyncio
+async def test_invoke_service_executes_and_reports(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The invoke service helper executes HA services and reports results."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry("entry-action", {"endpoint": "https://example.invalid/api"})
+
+    clients: list[_RecorderClient] = []
+
+    class _RecorderClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:  # noqa: ANN001
+            self.calls: list[dict[str, Any]] = []
+            clients.append(self)
+
+        async def async_post_json(self, payload: dict[str, Any]) -> None:
+            self.calls.append(payload)
+
+    class _StubExposure:
+        async def async_setup(self) -> None:
+            return None
+
+        async def async_shutdown(self) -> None:  # pragma: no cover - not invoked here
+            return None
+
+    monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
+    monkeypatch.setattr(integration, "AIEmbodiedClient", _RecorderClient)
+    monkeypatch.setattr(integration, "ExposureController", lambda *args, **kwargs: _StubExposure())
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    handler = hass.services.registered[(DOMAIN, integration.SERVICE_INVOKE_SERVICE)]["handler"]
+
+    def _call_handler(
+        domain: str,
+        service: str,
+        service_data: dict[str, Any],
+        *,
+        target: dict[str, Any] | None,
+        blocking: bool,
+        return_response: bool,
+        context: object | None,
+    ) -> dict[str, Any]:
+        assert domain == "light"
+        assert service == "turn_on"
+        assert service_data == {"brightness": 255}
+        assert blocking is True
+        assert return_response is True
+        assert target == {"entity_id": "light.kitchen"}
+        assert getattr(context, "id", None) == "ctx-1"
+        return {"status": "ok"}
+
+    hass.services.async_call_handler = _call_handler
+
+    call_data = {
+        "entry_id": entry.entry_id,
+        "domain": "light",
+        "service": "turn_on",
+        "service_data": {"brightness": 255},
+        "target": {"entity_id": "light.kitchen"},
+        "correlation_id": "corr-1",
+        "context_id": "ctx-1",
+        "context_user_id": "user-1",
+        "context_parent_id": "parent-1",
+    }
+
+    response = await handler(type("_Call", (), {"data": call_data})())
+
+    assert response == {
+        "success": True,
+        "result": {"status": "ok"},
+        "correlation_id": "corr-1",
+    }
+
+    assert hass.services.calls[0]["domain"] == "light"
+    assert hass.bus.events[0][0] == f"{DOMAIN}.action_executed"
+    event_payload = hass.bus.events[0][1]
+    assert event_payload["success"] is True
+    assert event_payload["correlation_id"] == "corr-1"
+    assert clients and clients[0].calls
+    upstream_payload = clients[0].calls[0]
+    assert upstream_payload["type"] == "action_result"
+    assert upstream_payload["action"]["result"] == {"status": "ok"}
+    assert upstream_payload["action"]["context"]["id"] == "ctx-1"
+
+
+@pytest.mark.asyncio
+async def test_invoke_service_reports_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Service call failures are captured and forwarded."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry("entry-action-fail", {"endpoint": "https://example.invalid/api"})
+
+    class _RecorderClient:
+        def __init__(self, *args: object, **kwargs: object) -> None:  # noqa: ANN001
+            self.calls: list[dict[str, Any]] = []
+
+        async def async_post_json(self, payload: dict[str, Any]) -> None:
+            self.calls.append(payload)
+
+    class _StubExposure:
+        async def async_setup(self) -> None:
+            return None
+
+        async def async_shutdown(self) -> None:  # pragma: no cover - not invoked here
+            return None
+
+    monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
+    client = _RecorderClient(None, None)
+    monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: client)
+    monkeypatch.setattr(integration, "ExposureController", lambda *args, **kwargs: _StubExposure())
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    handler = hass.services.registered[(DOMAIN, integration.SERVICE_INVOKE_SERVICE)]["handler"]
+
+    def _call_handler(*args: object, **kwargs: object) -> None:  # noqa: ANN001
+        raise HomeAssistantError("boom")
+
+    hass.services.async_call_handler = _call_handler
+
+    call_data = {
+        "entry_id": entry.entry_id,
+        "domain": "light",
+        "service": "turn_on",
+    }
+
+    response = await handler(type("_Call", (), {"data": call_data})())
+    assert response["success"] is False
+    assert "boom" in response["error"]
+
+    event_type, event_payload = hass.bus.events[0]
+    assert event_type == f"{DOMAIN}.action_executed"
+    assert event_payload["success"] is False
+    assert "boom" in event_payload["error"]
+    assert client.calls
+    assert client.calls[0]["action"]["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_invoke_service_validates_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Invalid payload data raises errors before execution."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry("entry-action-validate", {"endpoint": "https://example.invalid/api"})
+
+    monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
+    monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
+
+    class _StubExposure:
+        async def async_setup(self) -> None:
+            return None
+
+        async def async_shutdown(self) -> None:  # pragma: no cover - unload not exercised
+            return None
+
+    monkeypatch.setattr(
+        integration,
+        "ExposureController",
+        lambda *args, **kwargs: _StubExposure(),
+    )
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    handler = hass.services.registered[(DOMAIN, integration.SERVICE_INVOKE_SERVICE)]["handler"]
+
+    with pytest.raises(HomeAssistantError):
+        await handler(type("_Call", (), {"data": {"entry_id": entry.entry_id, "domain": 123}})())
+
+    with pytest.raises(HomeAssistantError):
+        await handler(
+            type(
+                "_Call",
+                (),
+                {
+                    "data": {
+                        "entry_id": entry.entry_id,
+                        "domain": "light",
+                        "service": "turn_on",
+                        "service_data": 5,
+                    }
+                },
+            )(),
+        )
