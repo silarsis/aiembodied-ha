@@ -10,6 +10,7 @@ from homeassistant.core import Context, Event, HomeAssistant, State, callback
 from homeassistant.helpers.event import MATCH_ALL, async_track_state_change_event
 
 from .api_client import AIEmbodiedClient, AIEmbodiedClientError
+from .autonomy import AutonomyController
 from .const import DOMAIN
 
 if TYPE_CHECKING:  # pragma: no cover - imported for typing only
@@ -62,6 +63,7 @@ class ExposureController:
         client: AIEmbodiedClient,
         config: "IntegrationConfig",
         entry_id: str,
+        autonomy: AutonomyController | None = None,
     ) -> None:
         self._hass = hass
         self._client = client
@@ -69,6 +71,8 @@ class ExposureController:
         self._entry_id = entry_id
         self._filters = _ExposureFilters.from_iterable(config.exposure)
         self._unsubscribe: Callable[[], None] | None = None
+        self._autonomy = autonomy
+        self._paused = False
 
     async def async_setup(self) -> None:
         """Attach listeners when exposures are configured."""
@@ -89,10 +93,30 @@ class ExposureController:
         self._unsubscribe()
         self._unsubscribe = None
 
+    async def async_set_paused(self, paused: bool) -> None:
+        """Pause or resume state tracking."""
+
+        if paused == self._paused:
+            return
+        self._paused = paused
+        if paused:
+            if self._unsubscribe is not None:
+                self._unsubscribe()
+                self._unsubscribe = None
+            return
+
+        if self._filters.entities or self._filters.domains:
+            if self._unsubscribe is None:
+                self._unsubscribe = async_track_state_change_event(
+                    self._hass, MATCH_ALL, self._handle_state_change
+                )
+
     @callback
     def _handle_state_change(self, event: Event) -> None:
         entity_id: str | None = event.data.get("entity_id")
         if not entity_id or not self._filters.allows(entity_id):
+            return
+        if self._paused:
             return
 
         old_state: State | None = event.data.get("old_state")
@@ -115,11 +139,15 @@ class ExposureController:
         except AIEmbodiedClientError as exc:
             audit["success"] = False
             audit["error"] = str(exc)
+            if self._autonomy is not None:
+                await self._autonomy.record_failure("event_forward", str(exc))
             _LOGGER.warning(
                 "Failed to forward update for %s: %s", audit["entity_id"], exc, exc_info=True
             )
         else:
             audit["success"] = True
+            if self._autonomy is not None:
+                self._autonomy.record_success()
 
         self._hass.bus.async_fire(f"{DOMAIN}.update_forwarded", audit)
 

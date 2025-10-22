@@ -7,7 +7,7 @@
 - [x] Step 4 – Assist routing helpers completed in this iteration.
 - [x] Step 5 – Event & script exposure completed in this iteration.
 - [x] Step 6 – Outbound action execution completed in this iteration.
-- [ ] Step 7 – Autonomy controls & diagnostics (pending).
+- [x] Step 7 – Autonomy controls & diagnostics completed in this iteration.
 - [ ] Step 8 – Networking & resilience enhancements (pending).
 - [ ] Step 9 – Observability improvements (pending).
 - [ ] Step 10 – Testing & examples (unit test coverage verified in this iteration; additional samples pending).
