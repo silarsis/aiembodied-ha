@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any
 
 import pytest
@@ -15,11 +14,39 @@ from homeassistant.core import Context, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 
-@dataclass
 class _DummyConfigEntries:
     """Minimal config entries manager used for reload tests."""
 
-    async_reload: Any
+    def __init__(self, hass: "_DummyHass") -> None:
+        self._hass = hass
+        self.forwarded: list[tuple[Any, list[Any]]] = []
+        self.unloaded: list[tuple[Any, list[Any]]] = []
+
+    async def async_reload(self, entry_id: str) -> None:
+        await self._hass._async_reload(entry_id)
+
+    async def async_forward_entry_setups(
+        self, entry: Any, platforms: Any
+    ) -> None:  # noqa: ANN001
+        self.forwarded.append((entry, list(platforms)))
+
+    async def async_unload_platforms(
+        self, entry: Any, platforms: Any
+    ) -> bool:  # noqa: ANN001
+        self.unloaded.append((entry, list(platforms)))
+        return True
+
+    async def async_update_entry(
+        self,
+        entry: "_MockConfigEntry",
+        *,
+        data: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> None:
+        if options is not None:
+            entry.options = dict(options)
+        if entry._update_listener is not None:
+            await entry._update_listener(None, entry)
 
 
 class _DummyHass(HomeAssistant):
@@ -27,7 +54,7 @@ class _DummyHass(HomeAssistant):
 
     def __init__(self) -> None:
         super().__init__()
-        self.config_entries = _DummyConfigEntries(async_reload=self._async_reload)
+        self.config_entries = _DummyConfigEntries(self)
         self.reloads: list[str] = []
         self.services = _DummyServices()
 
@@ -84,6 +111,7 @@ class _MockConfigEntry:
     def __init__(self, entry_id: str, data: dict[str, Any]) -> None:
         self.entry_id = entry_id
         self.data = data
+        self.options: dict[str, Any] = {}
         self._update_listener: Any = None
         self._unload_callbacks: list[Any] = []
 

@@ -9,12 +9,14 @@ from typing import Any, Mapping
 from aiohttp import ClientSession
 from homeassistant.components import conversation as ha_conversation
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import Context, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import aiohttp_client
 from homeassistant.helpers.typing import ConfigType
 
 from .api_client import AIEmbodiedClient, AIEmbodiedClientConfig, AIEmbodiedClientError
+from .autonomy import AutonomyController
 from .config_flow import AIEmbodiedOptionsFlowHandler
 from .const import (
     CONF_AUTH_TOKEN,
@@ -26,6 +28,12 @@ from .const import (
     CONF_THROTTLE,
     DATA_RUNTIME,
     DOMAIN,
+    OPTIONS_AUTONOMY_PAUSED,
+    OPTIONS_BURST_SIZE,
+    OPTIONS_DEBUG,
+    OPTIONS_MAX_EVENTS_PER_MINUTE,
+    RUNTIME_DATA_AUTONOMY,
+    RUNTIME_DATA_OPTIONS,
 )
 from .conversation import AIEmbodiedConversationAgent
 from .exposure import ExposureController
@@ -34,6 +42,12 @@ TYPE_CHECKING = False
 
 
 _LOGGER = logging.getLogger(__name__)
+
+PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.SENSOR,
+    Platform.SWITCH,
+]
 
 
 @dataclass(slots=True)
@@ -50,6 +64,16 @@ class IntegrationConfig:
 
 
 @dataclass(slots=True)
+class IntegrationOptions:
+    """Normalized configuration entry options."""
+
+    debug: bool = False
+    max_events_per_minute: int | None = None
+    burst_size: int | None = None
+    autonomy_paused: bool = False
+
+
+@dataclass(slots=True)
 class RuntimeData:
     """Container for per-config entry runtime resources."""
 
@@ -57,6 +81,8 @@ class RuntimeData:
     config: IntegrationConfig
     agent: AIEmbodiedConversationAgent
     exposure: ExposureController | None
+    options: IntegrationOptions
+    autonomy: AutonomyController
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -72,20 +98,43 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     hass.data.setdefault(DOMAIN, {})
 
+    options = _create_integration_options(entry.options)
+    _apply_debug_logging(options)
+
     runtime_config = _create_integration_config(entry.data)
     client = _create_client(hass, runtime_config)
     agent = AIEmbodiedConversationAgent(client, runtime_config)
-    exposure = ExposureController(hass, client, runtime_config, entry.entry_id)
+    autonomy = AutonomyController(
+        hass,
+        entry,
+        initial_paused=options.autonomy_paused,
+    )
+    exposure = ExposureController(
+        hass,
+        client,
+        runtime_config,
+        entry.entry_id,
+        autonomy,
+    )
+    autonomy.add_pause_callbacks([exposure.async_set_paused])
     await exposure.async_setup()
+    await autonomy.async_set_paused(options.autonomy_paused, persist=False, force_notify=True)
     runtime = RuntimeData(
         client=client,
         config=runtime_config,
         agent=agent,
         exposure=exposure,
+        options=options,
+        autonomy=autonomy,
     )
-    hass.data[DOMAIN][entry.entry_id] = {DATA_RUNTIME: runtime}
+    hass.data[DOMAIN][entry.entry_id] = {
+        DATA_RUNTIME: runtime,
+        RUNTIME_DATA_OPTIONS: options,
+        RUNTIME_DATA_AUTONOMY: autonomy,
+    }
 
     ha_conversation.async_set_agent(hass, entry, agent)
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     entry.async_on_unload(entry.add_update_listener(_async_reload_entry))
     return True
 
@@ -94,6 +143,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
 
     ha_conversation.async_unset_agent(hass, entry)
+    await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
     runtime_wrapper = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     runtime: RuntimeData | None = None
     if runtime_wrapper is not None:
@@ -136,6 +187,29 @@ def _create_integration_config(entry_data: dict[str, Any]) -> IntegrationConfig:
     )
 
 
+def _create_integration_options(entry_options: Mapping[str, Any]) -> IntegrationOptions:
+    """Normalize config entry options."""
+
+    max_events = entry_options.get(OPTIONS_MAX_EVENTS_PER_MINUTE)
+    if isinstance(max_events, int) and max_events > 0:
+        normalized_max = max_events
+    else:
+        normalized_max = None
+
+    burst_size = entry_options.get(OPTIONS_BURST_SIZE)
+    if isinstance(burst_size, int) and burst_size > 0:
+        normalized_burst = burst_size
+    else:
+        normalized_burst = None
+
+    return IntegrationOptions(
+        debug=bool(entry_options.get(OPTIONS_DEBUG, False)),
+        max_events_per_minute=normalized_max,
+        burst_size=normalized_burst,
+        autonomy_paused=bool(entry_options.get(OPTIONS_AUTONOMY_PAUSED, False)),
+    )
+
+
 async def async_get_options_flow(
     config_entry: ConfigEntry,
 ) -> AIEmbodiedOptionsFlowHandler:
@@ -148,6 +222,16 @@ def _async_get_clientsession(hass: HomeAssistant) -> ClientSession:
     """Retrieve the shared aiohttp client session."""
 
     return aiohttp_client.async_get_clientsession(hass)
+
+
+def _apply_debug_logging(options: IntegrationOptions) -> None:
+    """Adjust module logging based on the debug option."""
+
+    package_logger = logging.getLogger(__package__ or DOMAIN)
+    if options.debug:
+        package_logger.setLevel(logging.DEBUG)
+    else:
+        package_logger.setLevel(logging.NOTSET)
 
 
 SERVICE_SEND_CONVERSATION_TURN = "send_conversation_turn"
@@ -223,6 +307,11 @@ def _async_register_services(hass: HomeAssistant) -> None:
                 f"Integration for entry_id '{entry_id}' is not currently active"
             )
 
+        if runtime.autonomy.paused:
+            raise HomeAssistantError(
+                "Autonomy is currently paused for this Embodied AI instance"
+            )
+
         context = _context_from_service_data(data)
         domain = data[ATTR_DOMAIN]
         service = data[ATTR_SERVICE]
@@ -295,6 +384,9 @@ def _async_register_services(hass: HomeAssistant) -> None:
             _LOGGER.warning(
                 "Failed to report action result for %s.%s: %s", domain, service, exc, exc_info=True
             )
+            await runtime.autonomy.record_failure("action_result", str(exc))
+        else:
+            runtime.autonomy.record_success()
 
         response: dict[str, Any] = {
             "success": success,

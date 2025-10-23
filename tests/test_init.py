@@ -2,22 +2,58 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from typing import Any
+from collections.abc import Awaitable, Callable, Iterable
+from typing import Any, Mapping
 
 import pytest
 
 import custom_components.aiembodied as integration
-from custom_components.aiembodied.const import DATA_RUNTIME, DOMAIN
+from custom_components.aiembodied.const import (
+    DATA_RUNTIME,
+    DOMAIN,
+    OPTIONS_AUTONOMY_PAUSED,
+)
 from homeassistant.exceptions import HomeAssistantError
 
 
-@dataclass
 class _DummyConfigEntries:
     """Minimal config entries manager for testing reload behavior."""
 
-    async_reload: Callable[[str], Awaitable[None]]
+    def __init__(self, hass: "_DummyHass") -> None:
+        self._hass = hass
+        self.forwarded: list[tuple[object, list[object]]] = []
+        self.unloaded: list[tuple[object, list[object]]] = []
+        self.updated: list[dict[str, Any]] = []
+
+    async def async_reload(self, entry_id: str) -> None:
+        await self._hass._async_reload(entry_id)
+
+    async def async_forward_entry_setups(
+        self, entry: object, platforms: Iterable[object]
+    ) -> None:  # noqa: ANN001 - signature mirrors Home Assistant
+        self.forwarded.append((entry, list(platforms)))
+
+    async def async_unload_platforms(
+        self, entry: object, platforms: Iterable[object]
+    ) -> bool:  # noqa: ANN001 - signature mirrors Home Assistant
+        self.unloaded.append((entry, list(platforms)))
+        return True
+
+    async def async_update_entry(
+        self,
+        entry: "_MockConfigEntry",
+        *,
+        data: Mapping[str, Any] | None = None,
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
+        if data is not None:  # pragma: no cover - not exercised in these tests
+            entry.data = dict(data)
+        if options is not None:
+            entry.options = dict(options)
+            self.updated.append(dict(options))
+        listener = entry._update_listener
+        if listener is not None:
+            await listener(self._hass, entry)
 
 
 class _DummyHass:
@@ -25,7 +61,7 @@ class _DummyHass:
 
     def __init__(self) -> None:
         self.data: dict[str, dict[str, object]] = {}
-        self.config_entries = _DummyConfigEntries(async_reload=self._async_reload)
+        self.config_entries = _DummyConfigEntries(self)
         self.reload_requests: list[str] = []
         self.services = _DummyServices()
         self.bus = _DummyBus()
@@ -107,12 +143,26 @@ class _DummyServices:
         return result
 
 
+class _BaseExposure:
+    """Common stub implementing the exposure controller interface."""
+
+    async def async_setup(self) -> None:
+        return None
+
+    async def async_shutdown(self) -> None:
+        return None
+
+    async def async_set_paused(self, paused: bool) -> None:  # noqa: ARG002
+        return None
+
+
 class _MockConfigEntry:
     """Small stub mimicking the ConfigEntry interface used by the integration."""
 
     def __init__(self, entry_id: str, data: dict[str, object]) -> None:
         self.entry_id = entry_id
         self.data = data
+        self.options: dict[str, Any] = {}
         self._update_listener: Callable[[object], Awaitable[None]] | None = None
         self._unload_callbacks: list[Callable[[], None]] = []
 
@@ -186,6 +236,7 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
             client_obj: object,
             config_obj: object,
             entry_id: str,
+            autonomy: object,
         ) -> None:  # noqa: ANN001
             self.hass = hass_obj
             self.client = client_obj
@@ -193,6 +244,7 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
             self.entry_id = entry_id
             self.setup_calls = 0
             self.shutdown_calls = 0
+            self.pause_calls: list[bool] = []
             controllers.append(self)
 
         async def async_setup(self) -> None:
@@ -200,6 +252,9 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
 
         async def async_shutdown(self) -> None:
             self.shutdown_calls += 1
+
+        async def async_set_paused(self, paused: bool) -> None:
+            self.pause_calls.append(paused)
 
     def _fake_session_factory(hass_obj: object) -> object:  # noqa: ANN001 - signature for monkeypatch
         return object()
@@ -227,6 +282,11 @@ async def test_async_setup_entry_stores_runtime(monkeypatch: pytest.MonkeyPatch)
     assert isinstance(runtime.client, _DummyClient)
     assert created_clients, "Expected client factory to be invoked"
     assert controllers and controllers[0].setup_calls == 1
+    assert controllers[0].pause_calls == [False]
+    assert hass.config_entries.forwarded
+    forwarded_entry, platforms = hass.config_entries.forwarded[0]
+    assert forwarded_entry is entry
+    assert list(platforms) == list(integration.PLATFORMS)
 
 
 @pytest.mark.asyncio
@@ -245,6 +305,9 @@ async def test_async_unload_entry_cleans_runtime(monkeypatch: pytest.MonkeyPatch
 
         async def async_shutdown(self) -> None:
             self.shutdown_calls += 1
+
+        async def async_set_paused(self, paused: bool) -> None:  # noqa: ARG002 - parity with controller
+            return None
 
     exposure_instances: list[_DummyExposure] = []
 
@@ -294,12 +357,8 @@ async def test_services_registered_once(monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
     monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
 
-    class _StubExposure:
-        async def async_setup(self) -> None:
-            return None
-
-        async def async_shutdown(self) -> None:  # pragma: no cover - unload not exercised
-            return None
+    class _StubExposure(_BaseExposure):
+        pass
 
     monkeypatch.setattr(
         integration,
@@ -335,12 +394,8 @@ async def test_invoke_service_executes_and_reports(monkeypatch: pytest.MonkeyPat
         async def async_post_json(self, payload: dict[str, Any]) -> None:
             self.calls.append(payload)
 
-    class _StubExposure:
-        async def async_setup(self) -> None:
-            return None
-
-        async def async_shutdown(self) -> None:  # pragma: no cover - not invoked here
-            return None
+    class _StubExposure(_BaseExposure):
+        pass
 
     monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
     monkeypatch.setattr(integration, "AIEmbodiedClient", _RecorderClient)
@@ -405,6 +460,89 @@ async def test_invoke_service_executes_and_reports(monkeypatch: pytest.MonkeyPat
 
 
 @pytest.mark.asyncio
+async def test_invoke_service_blocked_when_paused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Service invocations are rejected when autonomy is paused."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry("entry-paused", {"endpoint": "https://example.invalid/api"})
+    entry.options[OPTIONS_AUTONOMY_PAUSED] = True
+
+    class _StubExposure:
+        async def async_setup(self) -> None:
+            return None
+
+        async def async_shutdown(self) -> None:  # pragma: no cover - not invoked here
+            return None
+
+        async def async_set_paused(self, paused: bool) -> None:  # noqa: ARG002
+            return None
+
+    monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
+    monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(integration, "ExposureController", lambda *args, **kwargs: _StubExposure())
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    handler = hass.services.registered[(DOMAIN, integration.SERVICE_INVOKE_SERVICE)]["handler"]
+
+    paused_call = type(
+        "_Call",
+        (),
+        {"data": {"entry_id": entry.entry_id, "domain": "light", "service": "turn_on"}},
+    )()
+
+    with pytest.raises(HomeAssistantError, match="Autonomy is currently paused"):
+        await handler(paused_call)
+
+
+@pytest.mark.asyncio
+async def test_autonomy_state_updates_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Toggling autonomy updates config entry options and triggers reload."""
+
+    hass = _DummyHass()
+    entry = _MockConfigEntry("entry-autonomy", {"endpoint": "https://example.invalid/api"})
+
+    class _StubExposure:
+        def __init__(self, *args: object, **kwargs: object) -> None:  # noqa: ANN001
+            self.pause_states: list[bool] = []
+
+        async def async_setup(self) -> None:
+            return None
+
+        async def async_shutdown(self) -> None:  # pragma: no cover - not invoked here
+            return None
+
+        async def async_set_paused(self, paused: bool) -> None:
+            self.pause_states.append(paused)
+
+    exposure_instances: list[_StubExposure] = []
+
+    def _exposure_factory(*args: object, **kwargs: object) -> _StubExposure:  # noqa: ANN001
+        instance = _StubExposure(*args, **kwargs)
+        exposure_instances.append(instance)
+        return instance
+
+    monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
+    monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: object())
+    monkeypatch.setattr(integration, "ExposureController", _exposure_factory)
+
+    await integration.async_setup(hass, {})
+    await integration.async_setup_entry(hass, entry)
+
+    runtime = hass.data[DOMAIN][entry.entry_id][DATA_RUNTIME]
+    assert runtime.autonomy.paused is False
+
+    await runtime.autonomy.async_set_paused(True)
+
+    assert runtime.autonomy.paused is True
+    assert entry.options[OPTIONS_AUTONOMY_PAUSED] is True
+    assert hass.reload_requests == [entry.entry_id]
+    assert hass.config_entries.updated[-1][OPTIONS_AUTONOMY_PAUSED] is True
+    assert exposure_instances and exposure_instances[0].pause_states[-1] is True
+
+
+@pytest.mark.asyncio
 async def test_invoke_service_reports_failures(monkeypatch: pytest.MonkeyPatch) -> None:
     """Service call failures are captured and forwarded."""
 
@@ -418,17 +556,10 @@ async def test_invoke_service_reports_failures(monkeypatch: pytest.MonkeyPatch) 
         async def async_post_json(self, payload: dict[str, Any]) -> None:
             self.calls.append(payload)
 
-    class _StubExposure:
-        async def async_setup(self) -> None:
-            return None
-
-        async def async_shutdown(self) -> None:  # pragma: no cover - not invoked here
-            return None
-
     monkeypatch.setattr(integration, "_async_get_clientsession", lambda hass_obj: object())
     client = _RecorderClient(None, None)
     monkeypatch.setattr(integration, "AIEmbodiedClient", lambda *args, **kwargs: client)
-    monkeypatch.setattr(integration, "ExposureController", lambda *args, **kwargs: _StubExposure())
+    monkeypatch.setattr(integration, "ExposureController", lambda *args, **kwargs: _BaseExposure())
 
     await integration.async_setup(hass, {})
     await integration.async_setup_entry(hass, entry)
@@ -473,6 +604,9 @@ async def test_invoke_service_validates_payload(monkeypatch: pytest.MonkeyPatch)
             return None
 
         async def async_shutdown(self) -> None:  # pragma: no cover - unload not exercised
+            return None
+
+        async def async_set_paused(self, paused: bool) -> None:  # noqa: ARG002
             return None
 
     monkeypatch.setattr(

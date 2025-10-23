@@ -23,3 +23,11 @@ OPTIONS_AUTONOMY_PAUSED: Final = "autonomy_paused"
 
 RUNTIME_DATA_CLIENT: Final = "client"
 RUNTIME_DATA_CONFIG: Final = "config"
+RUNTIME_DATA_OPTIONS: Final = "options"
+RUNTIME_DATA_AUTONOMY: Final = "autonomy"
+
+SIGNAL_AUTONOMY_STATE_CHANGED: Final = "autonomy_state_changed"
+SIGNAL_DIAGNOSTICS_UPDATED: Final = "diagnostics_updated"
+
+NOTIFICATION_AUTONOMY_FAILURE: Final = "aiembodied_autonomy_failure"
+AUTONOMY_FAILURE_THRESHOLD: Final = 3

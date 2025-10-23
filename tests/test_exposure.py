@@ -39,6 +39,16 @@ class _DummyBus:
         self.events.append((event_type, event_data))
 
 
+class _RecorderAutonomy:
+    def __init__(self) -> None:
+        self.failures: list[tuple[str, str]] = []
+        self.successes = 0
+
+    async def record_failure(self, source: str, message: str) -> None:
+        self.failures.append((source, message))
+
+    def record_success(self) -> None:
+        self.successes += 1
 class _DummyHass:
     def __init__(self) -> None:
         self.loop = asyncio.get_running_loop()
@@ -88,7 +98,10 @@ async def test_controller_forwards_matching_state(monkeypatch: pytest.MonkeyPatc
         async def async_post_json(self, payload: dict[str, object]) -> None:
             client_calls.append(payload)
 
-    controller = ExposureController(hass, _DummyClient(), config, entry_id="entry-1")
+    autonomy = _RecorderAutonomy()
+    controller = ExposureController(
+        hass, _DummyClient(), config, entry_id="entry-1", autonomy=autonomy
+    )
     await controller.async_setup()
     assert callbacks, "Expected state listener to be registered"
 
@@ -108,6 +121,8 @@ async def test_controller_forwards_matching_state(monkeypatch: pytest.MonkeyPatc
     assert data["context"]["id"] == "ctx-1"
     assert hass.bus.events[0][0] == "aiembodied.update_forwarded"
     assert hass.bus.events[0][1]["success"] is True
+    assert autonomy.successes == 1
+    assert not autonomy.failures
 
 
 @pytest.mark.asyncio
@@ -173,7 +188,10 @@ async def test_controller_records_failures(monkeypatch: pytest.MonkeyPatch) -> N
         async def async_post_json(self, payload: dict[str, object]) -> None:
             raise AIEmbodiedClientError("failure")
 
-    controller = ExposureController(hass, _FailingClient(), config, entry_id="entry-3")
+    autonomy = _RecorderAutonomy()
+    controller = ExposureController(
+        hass, _FailingClient(), config, entry_id="entry-3", autonomy=autonomy
+    )
     await controller.async_setup()
 
     controller._handle_state_change(
@@ -191,3 +209,54 @@ async def test_controller_records_failures(monkeypatch: pytest.MonkeyPatch) -> N
     assert event_type == "aiembodied.update_forwarded"
     assert data["success"] is False
     assert "failure" in data["error"]
+    assert autonomy.failures
+
+
+@pytest.mark.asyncio
+async def test_controller_pause_stops_forwarding(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pausing the controller prevents updates from being sent."""
+
+    hass = _DummyHass()
+    config = IntegrationConfig(
+        endpoint="https://example.invalid/api",
+        auth_token=None,
+        headers={},
+        exposure=["light.kitchen"],
+    )
+
+    monkeypatch.setattr(
+        "custom_components.aiembodied.exposure.async_track_state_change_event",
+        lambda *args, **kwargs: (lambda: None),
+    )
+
+    class _RecorderClient:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        async def async_post_json(self, payload: dict[str, object]) -> None:
+            self.calls.append(payload)
+
+    autonomy = _RecorderAutonomy()
+    client = _RecorderClient()
+    controller = ExposureController(
+        hass,
+        client,
+        config,
+        entry_id="entry-pause",
+        autonomy=autonomy,
+    )
+    await controller.async_setup()
+    await controller.async_set_paused(True)
+
+    controller._handle_state_change(
+        _FakeEvent(
+            entity_id="light.kitchen",
+            old_state=State("light.kitchen", "off", {}),
+            new_state=State("light.kitchen", "on", {}),
+            context=None,
+        )
+    )
+    await hass.async_drain()
+
+    assert not client.calls
+    assert not hass.bus.events
